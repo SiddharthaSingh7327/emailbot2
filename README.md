@@ -2,7 +2,8 @@
 
 This script automatically reads new emails from an Outlook inbox, uses Google's AI to identify and analyze potential sales opportunities, and logs them into a structured Excel file on SharePoint.
 
-## ✨ Features
+
+Features
 
 * **Smart Email Fetching**: Only processes emails that have arrived since the last time it ran.
 * **AI-Powered Analysis**: Uses Google Gemini to find sales leads and extract key details like contact info, company, and a summary.
@@ -10,15 +11,15 @@ This script automatically reads new emails from an Outlook inbox, uses Google's 
 * **Structured Logging**: Organizes data into two separate, linked tables in Excel: a master list of opportunities and a detailed log of all interactions.
 * **Secure Authentication**: Connects to your Microsoft 365 account securely.
 
-## 🚀 Setup Guide
+Setup Guide
 
-### Prerequisites
+Prerequisites:-
 
 * Python 3.8+
 * A Microsoft 365 work or school account
 * A Google AI account to get an API key
 
-### Step 1: Azure App Registration
+Step 1: Azure App Registration
 
 You need to give the script permission to read your emails.
 
@@ -32,12 +33,12 @@ You need to give the script permission to read your emails.
 8.  Check the box for the `https://login.microsoftonline.com/common/oauth2/nativeclient` redirect URI.
 9.  At the bottom of the page, set **"Allow public client flows"** to **Yes** and click **Save**.
 
-### Step 2: Get Your Google Gemini API Key
+Step 2: Get Your Google Gemini API Key
 
-1.  Go to **[Google AI Studio](https://aistudio.google.com/)**.
+1.  Go to **[Google AI Studio](https://aistudio.google.com/).
 2.  Click **"Get API key"** and copy your key.
 
-### Step 3: Prepare the Excel File
+Step 3: Prepare the Excel File
 
 1.  On your SharePoint or OneDrive, create a **new Excel workbook** (e.g., `LeadTracker.xlsx`).
 2.  Rename the first sheet to exactly `OpportunitiesMaster`.
@@ -47,7 +48,7 @@ You need to give the script permission to read your emails.
 5.  **On the `InteractionLog` sheet**, create these headers and format them as a table named **`InteractionsTable`**:
     * `Opportunity ID`, `Interaction Date`, `Status`, `Type`, `Sender`, `Summary`, `Action Item`, `Deadline`
 
-### Step 4: Configure the Script
+Step 4: Configure the Script
 
 Open the `EmailBot2.py` file and paste your credentials directly into the configuration section at the top of the script.
 
