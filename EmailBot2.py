@@ -24,10 +24,10 @@ logging.basicConfig(
 )
 
 # === 2. Configuration ===
-CLIENT_ID = os.getenv("CLIENT_ID", "")
-TENANT_ID = os.getenv("TENANT_ID", "")
-EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "91d3f9fe-f30d-4409-85fa-fa4a7c24c047")
+TENANT_ID = os.getenv("TENANT_ID", "64a9da10-e764-406f-a749-552dade47aa9")
+EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "https://eucloidcom-my.sharepoint.com/:x:/g/personal/siddhartha_singh_eucloid_com/EZnDRhWCEx9NrGj4xpqFmPEBah6oHxAudbkgu5hRAqN_cg?e=x5pfJW")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCtecm-I_JzMVNtQHsAfzRykn1XbKwuPXU")
 SHEET_OPPORTUNITIES = "OpportunitiesMaster"
 SHEET_INTERACTIONS = "InteractionLog"
 TOKEN_CACHE_FILE = "msal_token_cache.bin"
@@ -207,7 +207,7 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
     relevant_historical = []
     if historical_emails:
         # Filter historical emails that might be relevant based on sender or keywords
-        sender_company = new_opportunity.get('contact_company', '').lower()
+        sender_company = (new_opportunity.get('contact_company') or '').lower()
         sender_email = new_opportunity.get('contact_email', '').lower()
         title_keywords = new_opportunity.get('title', '').lower().split()
         
@@ -374,12 +374,12 @@ def main():
         historical_emails = get_all_historical_emails(headers, months_back=6)
         
         # Get emails from last 24 hours for processing
-        last_24h_timestamp = read_last_run_timestamp()
+        time_24_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
         graph_url = (
-            f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"
-            f"$filter=receivedDateTime gt {last_24h_timestamp}&"
-            "$orderby=receivedDateTime desc"
-        )
+        f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"
+        f"$filter=receivedDateTime ge {time_24_hours_ago}&"
+        "$orderby=receivedDateTime desc"
+        )           
         response = requests.get(graph_url, headers=headers)
         response.raise_for_status()
         messages = response.json().get("value", [])
@@ -394,9 +394,9 @@ def main():
             if msg_id in processed_emails:
                 continue  # Skip already processed
                 
-            if "@eucloid.com" in sender_email or "noreply" in sender_email:
-                processed_emails.add(msg_id)  # Mark as processed but skip
-                continue
+            #if "@eucloid.com" in sender_email or "noreply" in sender_email:
+             #   processed_emails.add(msg_id)  # Mark as processed but skip
+              #  continue
                 
             new_messages.append(msg)
 
