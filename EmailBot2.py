@@ -24,16 +24,16 @@ logging.basicConfig(
 )
 
 # === 2. Configuration ===
-CLIENT_ID = os.getenv("CLIENT_ID", "")
-TENANT_ID = os.getenv("TENANT_ID", "")
-EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+CLIENT_ID = os.getenv("CLIENT_ID", "") # You will have to add your own client id
+TENANT_ID = os.getenv("TENANT_ID", "") # You will have to add your own tenant id
+EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "") ## You will have you own EXCEL link, the readme includes what to put in it
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") # You will have to generate your own gemini API key.
 SHEET_OPPORTUNITIES = "OpportunitiesMaster"
 SHEET_INTERACTIONS = "InteractionLog"
 TOKEN_CACHE_FILE = "msal_token_cache.bin"
 TIMESTAMP_FILE = "last_run_timestamp.txt" 
 PROCESSED_EMAILS_FILE = "processed_emails.json"  # Track processed emails to prevent duplicates
-SCOPES = ["User.Read", "Mail.Read", "Files.ReadWrite.All"]
+SCOPES = ["User.Read", "Mail.Read", "Files.ReadWrite.All"] # You will have to allow these in microsoft AZURE. If you dont do that then it will not work as it needs it to read your mail and extract the data from it.
 
 # === 3. Helper Functions ===
 html_converter = html2text.HTML2Text()
@@ -230,26 +230,29 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
     prompt = f"""
 You are a highly intelligent CRM de-duplication assistant. Your goal is to prevent duplicate opportunities and correctly link related communications.
 
-MATCHING RULES:
-1. Same company + same/similar project/product = MATCH
-2. Same email thread/conversation = MATCH  
-3. Follow-up emails about existing discussions = MATCH
-4. Be conservative - only match if highly confident (80%+ certainty)
-5. Consider variations in company names (e.g., "ABC Corp" vs "ABC Corporation")
+CRITICAL MATCHING RULES - READ CAREFULLY:
+1. **CONTENT MUST EXPLICITLY MENTION THE SAME PROJECT/PRODUCT**: The email must contain specific keywords, project names, product names, or technical details that directly reference the existing opportunity
+2. **SENDER IDENTITY ALONE IS NEVER ENOUGH**: Just because someone sent emails about Project A before does NOT mean their new generic email is about Project A
+3. **GENERIC COMMUNICATION = NO MATCH**: Generic messages like "thanks", "quick question", "status update", "did you get my message" should NEVER match unless they explicitly mention the project details
+4. **BURDEN OF PROOF**: You must find SPECIFIC CONTENT OVERLAP, not just assume relationship
 
-NEW OPPORTUNITY:
-- Company: "{new_opportunity.get('contact_company', 'NA')}"
-- Contact Email: "{new_opportunity.get('contact_email', 'NA')}"
+MANDATORY CONTENT ANALYSIS:
+- Does the new email mention specific project names, products, or technical terms from the existing opportunity?
+- Does it reference specific companies, contracts, or business details?
+- Is there clear topical connection beyond just being from the same person?
+
+NEW EMAIL TO ANALYZE:
 - Title: "{new_opportunity.get('title', 'NA')}"
-- Summary: "{new_opportunity.get('summary', 'NA')}"
+- Content: "{new_opportunity.get('summary', 'NA')}"
+- From: "{new_opportunity.get('contact_email', 'NA')}"
 
 {existing_list_str}
 
 {historical_context}
 
-Analyze all the context above and determine if this new opportunity matches an existing one.
+STRICT INSTRUCTION: Only return match=true if you can identify specific content words/phrases in the new email that directly relate to an existing opportunity's project/product. Generic communication from known senders should be treated as separate opportunities.
 
-Respond ONLY with valid JSON: {{"match": true/false, "opportunity_id": "The ID of the best match or null", "confidence": 0.0-1.0, "reason": "Brief explanation"}}
+Respond ONLY with valid JSON: {{"match": true/false, "opportunity_id": "The ID of the best match or null", "confidence": 0.0-1.0, "reason": "Brief explanation focusing on specific content analysis"}}
 """
     
     try:
@@ -258,7 +261,7 @@ Respond ONLY with valid JSON: {{"match": true/false, "opportunity_id": "The ID o
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
         result = json.loads(clean_response)
         
-        if result.get("match") and result.get("confidence", 0) >= 0.8:
+        if result.get("match") and result.get("confidence", 0) >= 0.9:
             logging.info(f"✅ High confidence match found: {result.get('reason', 'No reason provided')}")
             return result.get("opportunity_id"), relevant_historical
         elif result.get("match"):
@@ -342,17 +345,27 @@ def write_last_run_timestamp(timestamp):
     logging.info(f"✅ Timestamp {timestamp} saved for next run.")
 
 def append_rows_to_excel(rows, table_name, sheet_name, file_id, headers):
-    """Appends rows to a specified table in an Excel sheet."""
+    """Inserts new rows at the top of a specified table in an Excel sheet."""
     if not rows: return
-    logging.info(f"📝 Appending {len(rows)} row(s) to table '{table_name}'...")
-    url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/workbook/worksheets('{sheet_name}')/tables('{table_name}')/rows/add"
-    data = {"values": rows}
-    res = requests.post(url, headers=headers, json=data)
-    if res.status_code != 201:
-        logging.error(f"❌ Failed to append rows to {table_name}: {res.text}")
-        raise Exception(f"Failed to append rows: {res.text}")
-    else:
-        logging.info(f"✅ Successfully added {len(rows)} rows to {table_name}.")
+    
+    logging.info(f"📝 Inserting {len(rows)} new row(s) at the top of table '{table_name}'...")
+    
+    # Reverse the list of rows so the newest email ends up at the very top (row 0)
+    for row_data in reversed(rows):
+        url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/workbook/worksheets('{sheet_name}')/tables('{table_name}')/rows/add"
+        
+        # The 'index: 0' tells the API to insert this row at the top
+        data = {
+            "values": [row_data],
+            "index": 0
+        }
+        
+        res = requests.post(url, headers=headers, json=data)
+        
+        if res.status_code != 201:
+            logging.error(f"❌ Failed to insert row into {table_name}: {res.text}")
+        else:
+            logging.info(f"✅ Successfully inserted 1 row into {table_name}.")
 
 # === MAIN WORKFLOW ===
 def main():
@@ -503,7 +516,31 @@ def main():
                         body_text[:500], "Review", ""
                     ])
                 else:
-                    logging.info("❌ Could not link to any existing opportunity.")
+                    # CREATE NEW OPPORTUNITY FOR GENERAL EMAIL
+                    opp_id = str(uuid.uuid4())
+                    logging.info(f"✅ Creating new Opportunity ID '{opp_id}' for general email.")
+                    
+                    # Find the earliest mention of this general communication
+                    earliest_mention_date = find_earliest_mention(temp_opp, relevant_emails)
+                    first_mention_date = earliest_mention_date if earliest_mention_date else received_dt
+                    
+                    logging.info(f"📅 First mention date for general opportunity: {first_mention_date[:10]}")
+                    
+                    # Create new opportunity row for general email
+                    new_opportunity_rows.append([
+                        opp_id, sender_name, "NA", sender_email,
+                        "", subject, "General Communication", first_mention_date, conv_id, 
+                        body_text[:500]
+                    ])
+                    interaction_rows.append([
+                        opp_id, received_dt, "General Communication", "Email", sender_name, 
+                        body_text[:500], "Review", ""
+                    ])
+                    # Add to existing opportunities for subsequent matching in this run
+                    existing_opportunities_list.append({
+                        "id": opp_id, "summary": body_text[:500], 
+                        "title": subject, "company": "NA"
+                    })
 
             # Mark email as processed
             processed_emails.add(msg_id)
