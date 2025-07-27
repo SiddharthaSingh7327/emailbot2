@@ -24,10 +24,10 @@ logging.basicConfig(
 )
 
 # === 2. Configuration ===
-CLIENT_ID = os.getenv("CLIENT_ID", "") # You will have to add your own client id
-TENANT_ID = os.getenv("TENANT_ID", "") # You will have to add your own tenant id
-EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "") ## You will have you own EXCEL link, the readme includes what to put in it
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") # You will have to generate your own gemini API key.
+CLIENT_ID = os.getenv("CLIENT_ID", "91d3f9fe-f30d-4409-85fa-fa4a7c24c047") # You will have to add your own client id
+TENANT_ID = os.getenv("TENANT_ID", "64a9da10-e764-406f-a749-552dade47aa9") # You will have to add your own tenant id
+EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "https://eucloidcom-my.sharepoint.com/:x:/g/personal/siddhartha_singh_eucloid_com/EZnDRhWCEx9NrGj4xpqFmPEBah6oHxAudbkgu5hRAqN_cg?e=x5pfJW") ## You will have you own EXCEL link, the readme includes what to put in it
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCtecm-I_JzMVNtQHsAfzRykn1XbKwuPXU") # You will have to generate your own gemini API key.
 SHEET_OPPORTUNITIES = "OpportunitiesMaster"
 SHEET_INTERACTIONS = "InteractionLog"
 TOKEN_CACHE_FILE = "msal_token_cache.bin"
@@ -93,10 +93,10 @@ def get_all_historical_emails(headers, months_back=6):
     logging.info(f"📚 Fetching historical emails from {cutoff_date} for comprehensive matching...")
     
     graph_url = (
-        f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"
-        f"$filter=receivedDateTime gt {cutoff_date}&"
-        "$orderby=receivedDateTime desc&"
-        "$top=1000"  # Increase limit for historical data
+            f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"
+            f"$filter=receivedDateTime gt {cutoff_date}&"
+            "$orderby=receivedDateTime asc"
+            #"$top=1000"  # Increase limit for historical data
     )
     
     all_emails = []
@@ -188,90 +188,138 @@ def get_existing_opportunities_for_ai(headers, file_id):
 
 def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, historical_emails):
     """Uses AI to determine if a new opportunity is a follow-up to an existing one using comprehensive data."""
-    if not existing_opportunities and not historical_emails: 
+    
+    # 🔍 ALWAYS log debug info first
+    logging.info(f"🔍 DEBUG: Starting AI match analysis...")
+    logging.info(f"🔍 DEBUG: New opportunity details:")
+    logging.info(f"    - Title: '{new_opportunity.get('title', 'NA')}'")
+    logging.info(f"    - Summary: '{new_opportunity.get('summary', 'NA')[:100]}...'")
+    logging.info(f"    - Company: '{new_opportunity.get('contact_company', 'NA')}'")
+    logging.info(f"    - Email: '{new_opportunity.get('contact_email', 'NA')}'")
+    
+    logging.info(f"🔍 DEBUG: Matching against {len(existing_opportunities)} existing opportunities:")
+    if existing_opportunities:
+        for i, opp in enumerate(existing_opportunities[-3:]):  # Show last 3
+            logging.info(f"    [{len(existing_opportunities)-3+i}] Title: '{opp['title']}' | Company: '{opp['company']}' | ID: {opp['id'][:8]}...")
+    else:
+        logging.info("    - No existing opportunities to match against")
+    
+    if not existing_opportunities and not historical_emails:
+        logging.info("🔍 DEBUG: No existing opportunities or historical emails - returning None")
         return None, None
     
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    # Prepare existing opportunities context
-    existing_list_str = ""
-    if existing_opportunities:
-        existing_list_str = "EXISTING OPPORTUNITIES:\n" + "\n".join([
-            f"- ID: {opp['id']}, Company: {opp['company']}, Title: {opp['title']}, Summary: {opp['summary'][:200]}"
-            for opp in existing_opportunities[:20]  # Limit to prevent token overflow
-        ])
-    
-    # Prepare historical emails context (focus on relevant ones)
-    historical_context = ""
-    relevant_historical = []
-    if historical_emails:
-        # Filter historical emails that might be relevant based on sender or keywords
-        sender_company = (new_opportunity.get('contact_company') or '').lower()
-        sender_email = new_opportunity.get('contact_email', '').lower()
-        title_keywords = new_opportunity.get('title', '').lower().split()
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        logging.info("🔍 DEBUG: Gemini model configured successfully")
         
-        for email in historical_emails[:50]:  # Limit for performance
-            email_content = f"{email['subject']} {email['body']}".lower()
-            email_sender = email['sender_email'].lower()
-            
-            # Check for relevance
-            if (sender_company and sender_company in email_content) or \
-               (sender_email and sender_email == email_sender) or \
-               any(keyword in email_content for keyword in title_keywords if len(keyword) > 3):
-                relevant_historical.append(email)
-        
-        if relevant_historical:
-            historical_context = "\n\nRELEVANT HISTORICAL EMAILS:\n" + "\n".join([
-                f"- Date: {email['received_date'][:10]}, From: {email['sender_name']}, Subject: {email['subject']}, Preview: {email['body'][:200]}..."
-                for email in relevant_historical[:10]  # Further limit
+        # Prepare existing opportunities context
+        existing_list_str = ""
+        if existing_opportunities:
+            existing_list_str = "EXISTING OPPORTUNITIES:\n" + "\n".join([
+                f"- ID: {opp['id']}, Company: {opp['company']}, Title: {opp['title']}, Summary: {opp['summary'][:200]}"
+                for opp in existing_opportunities[-5:]  # Show last 5 for better context
             ])
-    
-    prompt = f"""
-You are a highly intelligent CRM de-duplication assistant. Your goal is to prevent duplicate opportunities and correctly link related communications.
+            logging.info(f"🔍 DEBUG: Prepared context with {len(existing_opportunities[-5:])} opportunities")
+        
+        # Prepare historical emails context (focus on relevant ones)
+        historical_context = ""
+        relevant_historical = []
+        if historical_emails:
+            # Filter historical emails that might be relevant based on sender or keywords
+            sender_company = (new_opportunity.get('contact_company') or '').lower()
+            sender_email = new_opportunity.get('contact_email', '').lower()
+            title_keywords = new_opportunity.get('title', '').lower().split()
+            
+            for email in historical_emails[:50]:  # Limit for performance
+                email_content = f"{email['subject']} {email['body']}".lower()
+                email_sender = email['sender_email'].lower()
+                
+                # Check for relevance
+                if (sender_company and sender_company in email_content) or \
+                   (sender_email and sender_email == email_sender) or \
+                   any(keyword in email_content for keyword in title_keywords if len(keyword) > 3):
+                    relevant_historical.append(email)
+            
+            if relevant_historical:
+                historical_context = "\n\nRELEVANT HISTORICAL EMAILS:\n" + "\n".join([
+                    f"- Date: {email['received_date'][:10]}, From: {email['sender_name']}, Subject: {email['subject']}, Preview: {email['body'][:200]}..."
+                    for email in relevant_historical[:10]  # Further limit
+                ])
+                logging.info(f"🔍 DEBUG: Found {len(relevant_historical)} relevant historical emails")
 
-CRITICAL MATCHING RULES - READ CAREFULLY:
-1. **CONTENT MUST EXPLICITLY MENTION THE SAME PROJECT/PRODUCT**: The email must contain specific keywords, project names, product names, or technical details that directly reference the existing opportunity
-2. **SENDER IDENTITY ALONE IS NEVER ENOUGH**: Just because someone sent emails about Project A before does NOT mean their new generic email is about Project A
-3. **GENERIC COMMUNICATION = NO MATCH**: Generic messages like "thanks", "quick question", "status update", "did you get my message" should NEVER match unless they explicitly mention the project details
-4. **BURDEN OF PROOF**: You must find SPECIFIC CONTENT OVERLAP, not just assume relationship
+        # 🔧 SIMPLIFIED PROMPT for better matching
+        prompt = f"""
+You are a CRM assistant analyzing if two business communications are about the same opportunity.
 
-MANDATORY CONTENT ANALYSIS:
-- Does the new email mention specific project names, products, or technical terms from the existing opportunity?
-- Does it reference specific companies, contracts, or business details?
-- Is there clear topical connection beyond just being from the same person?
+NEW EMAIL:
+Title: "{new_opportunity.get('title', 'NA')}"
+Summary: "{new_opportunity.get('summary', 'NA')[:300]}"
+Company: "{new_opportunity.get('contact_company', 'NA')}"
+Sender: "{new_opportunity.get('sender_name', 'NA')}"
 
-NEW EMAIL TO ANALYZE:
-- Title: "{new_opportunity.get('title', 'NA')}"
-- Content: "{new_opportunity.get('summary', 'NA')}"
-- From: "{new_opportunity.get('contact_email', 'NA')}"
-
+EXISTING OPPORTUNITIES TO MATCH AGAINST:
 {existing_list_str}
 
-{historical_context}
+MATCHING RULES:
+1. Same project name or very similar project (e.g., "Leadership Training" matches "Leadership Training Program")
+2. Same company name or clear company connection
+3. Similar service/product request
+4. "Re:" or follow-up indicators in subject
 
-STRICT INSTRUCTION: Only return match=true if you can identify specific content words/phrases in the new email that directly relate to an existing opportunity's project/product. Generic communication from known senders should be treated as separate opportunities.
+IMPORTANT: Be generous with matching - if it's clearly the same type of project/service, it should match!
 
-Respond ONLY with valid JSON: {{"match": true/false, "opportunity_id": "The ID of the best match or null", "confidence": 0.0-1.0, "reason": "Brief explanation focusing on specific content analysis"}}
+Respond ONLY with valid JSON:
+{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Brief explanation"}}
 """
-    
-    try:
-        logging.info("🤔 Performing comprehensive AI match analysis...")
+        
+        logging.info("🔍 DEBUG: Sending request to Gemini...")
+        logging.info(f"🔍 DEBUG: Prompt length: {len(prompt)} characters")
+        
         response = model.generate_content(prompt)
         clean_response = response.text.strip().replace("```json", "").replace("```", "")
+        
+        logging.info(f"🔍 DEBUG: Raw AI Response: '{clean_response}'")
+        
         result = json.loads(clean_response)
+        logging.info(f"🔍 DEBUG: Parsed AI Response: {result}")
         
-        if result.get("match") and result.get("confidence", 0) >= 0.9:
-            logging.info(f"✅ High confidence match found: {result.get('reason', 'No reason provided')}")
-            return result.get("opportunity_id"), relevant_historical
-        elif result.get("match"):
-            logging.info(f"⚠️ Low confidence match rejected: {result.get('reason', 'No reason provided')}")
+        confidence = result.get("confidence", 0)
+        is_match = result.get("match", False)
+        reason = result.get("reason", "No reason provided")
+        
+        logging.info(f"🔍 DEBUG: Match: {is_match}, Confidence: {confidence:.1%}")
+        logging.info(f"🔍 DEBUG: Reason: {reason}")
+        
+        # 🔧 LOWERED CONFIDENCE THRESHOLD even more for testing
+        confidence_threshold = 0.5  # Very low threshold for testing
+        
+        if is_match and confidence >= confidence_threshold:
+            opp_id = result.get("opportunity_id")
+            logging.info(f"✅ HIGH CONFIDENCE MATCH FOUND!")
+            logging.info(f"🎯 Matched to Opportunity ID: {opp_id}")
+            logging.info(f"🎯 Confidence: {confidence:.1%}")
+            logging.info(f"🎯 Reason: {reason}")
+            return opp_id, relevant_historical
+        elif is_match:
+            logging.info(f"⚠️ LOW CONFIDENCE MATCH REJECTED")
+            logging.info(f"⚠️ Confidence: {confidence:.1%} (threshold: {confidence_threshold:.1%})")
+            logging.info(f"⚠️ Reason: {reason}")
+        else:
+            logging.info(f"❌ NO MATCH FOUND")
+            logging.info(f"❌ Reason: {reason}")
         
         return None, relevant_historical
+        
+    except json.JSONDecodeError as e:
+        logging.error(f"❌ JSON parsing error: {e}")
+        logging.error(f"❌ Raw response was: '{clean_response}'")
+        return None, []
     except Exception as e:
-        logging.error(f"❌ AI contextual match failed: {e}"); 
-        return None, relevant_historical
-
+        logging.error(f"❌ AI contextual match failed with error: {e}")
+        logging.error(f"❌ Error type: {type(e).__name__}")
+        return None, []
+    
 def find_earliest_mention(opportunity_data, relevant_historical_emails):
     """Finds the earliest mention of this opportunity in historical emails using AI."""
     if not relevant_historical_emails:
@@ -387,16 +435,21 @@ def main():
         historical_emails = get_all_historical_emails(headers, months_back=6)
         
         # Get emails from last 24 hours for processing
+# Get emails from last 24 hours for processing
         time_24_hours_ago = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
         graph_url = (
         f"https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?"
         f"$filter=receivedDateTime ge {time_24_hours_ago}&"
         "$orderby=receivedDateTime desc"
-        )           
+        )       
         response = requests.get(graph_url, headers=headers)
         response.raise_for_status()
         messages = response.json().get("value", [])
         logging.info(f"📨 Found {len(messages)} emails from last 24 hours.")
+
+        # --- ADD THIS LINE ---
+        messages.sort(key=lambda msg: msg['receivedDateTime'])
+        # ---------------------
 
         # Filter out already processed emails and internal emails
         new_messages = []
@@ -423,6 +476,12 @@ def main():
 
         new_opportunity_rows = []
         interaction_rows = []
+
+        # Replace your main email processing loop with this improved version
+
+        # Replace your main email processing loop with this corrected version
+
+        # Enhanced email processing loop with debug logging
 
         for msg in new_messages:
             msg_id = msg.get('id')
@@ -452,9 +511,13 @@ def main():
                         'email_subject': subject
                     }
                     
+                    # 🔍 DEBUG: Show current matching list size
+                    logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
+                    
+                    # Use the current state of existing_opportunities_list (includes same-session opportunities)
                     opp_id, relevant_emails = find_related_opportunity_with_ai(
                         enhanced_opp, 
-                        existing_opportunities_list, 
+                        existing_opportunities_list,  # This is updated in real-time
                         historical_emails
                     )
                     
@@ -475,8 +538,6 @@ def main():
                         logging.info(f"📅 First mention date for opportunity: {first_mention_date[:10]}")
                         
                         contact_email = enhanced_opp.get("contact_email", "").strip()
-                        # Note: The 8th column (index 7) in OpportunitiesMaster should be "First Mention Date"
-                        # This represents when this opportunity was first mentioned, not when it was created in CRM
                         new_opportunity_rows.append([
                             opp_id, opp.get("contact_name", sender_name), 
                             opp.get("contact_company", "NA"), contact_email,
@@ -487,11 +548,16 @@ def main():
                             opp_id, received_dt, "New Lead", "Email", sender_name, 
                             opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
                         ])
-                        # Add to existing opportunities for subsequent matching in this run
-                        existing_opportunities_list.append({
-                            "id": opp_id, "summary": opp.get("summary", "N/A"), 
-                            "title": opp.get("title", subject), "company": opp.get("contact_company", "NA")
-                        })
+                        
+                        # ✅ Add to existing opportunities list IMMEDIATELY
+                        new_opp_for_matching = {
+                            "id": opp_id, 
+                            "summary": opp.get("summary", "N/A"), 
+                            "title": opp.get("title", subject), 
+                            "company": opp.get("contact_company", "NA")
+                        }
+                        existing_opportunities_list.append(new_opp_for_matching)
+                        logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
             else:
                 # Check if it's a follow-up to existing opportunity
                 logging.info("ℹ️ No new opportunities found. Checking for follow-ups...")
@@ -503,9 +569,13 @@ def main():
                     "sender_name": sender_name
                 }
                 
+                # 🔍 DEBUG: Show current matching list size
+                logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
+                
+                # Use the current state of existing_opportunities_list (includes same-session opportunities)
                 opp_id, relevant_emails = find_related_opportunity_with_ai(
                     temp_opp, 
-                    existing_opportunities_list, 
+                    existing_opportunities_list,  # This is updated in real-time
                     historical_emails
                 )
                 
@@ -536,15 +606,20 @@ def main():
                         opp_id, received_dt, "General Communication", "Email", sender_name, 
                         body_text[:500], "Review", ""
                     ])
-                    # Add to existing opportunities for subsequent matching in this run
-                    existing_opportunities_list.append({
-                        "id": opp_id, "summary": body_text[:500], 
-                        "title": subject, "company": "NA"
-                    })
+                    
+                    # ✅ Add to existing opportunities list IMMEDIATELY
+                    new_opp_for_matching = {
+                        "id": opp_id, 
+                        "summary": body_text[:500], 
+                        "title": subject, 
+                        "company": "NA"
+                    }
+                    existing_opportunities_list.append(new_opp_for_matching)
+                    logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
 
             # Mark email as processed
             processed_emails.add(msg_id)
-
+            
         # Save to Excel
         if new_opportunity_rows or interaction_rows:
             append_rows_to_excel(new_opportunity_rows, "OpportunitiesTable", SHEET_OPPORTUNITIES, excel_file_id, headers)
