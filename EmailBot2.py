@@ -24,10 +24,10 @@ logging.basicConfig(
 )
 
 # === 2. Configuration ===
-CLIENT_ID = os.getenv("CLIENT_ID", "91d3f9fe-f30d-4409-85fa-fa4a7c24c047") # You will have to add your own client id
-TENANT_ID = os.getenv("TENANT_ID", "64a9da10-e764-406f-a749-552dade47aa9") # You will have to add your own tenant id
-EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "https://eucloidcom-my.sharepoint.com/:x:/g/personal/siddhartha_singh_eucloid_com/EZnDRhWCEx9NrGj4xpqFmPEBah6oHxAudbkgu5hRAqN_cg?e=x5pfJW") ## You will have you own EXCEL link, the readme includes what to put in it
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCtecm-I_JzMVNtQHsAfzRykn1XbKwuPXU") # You will have to generate your own gemini API key.
+CLIENT_ID = os.getenv("CLIENT_ID", "") # You will have to add your own client id
+TENANT_ID = os.getenv("TENANT_ID", "") # You will have to add your own tenant id
+EXCEL_SHARE_LINK = os.getenv("EXCEL_SHARE_LINK", "") ## You will have you own EXCEL link, the readme includes what to put in it
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") # You will have to generate your own gemini API key.
 SHEET_OPPORTUNITIES = "OpportunitiesMaster"
 SHEET_INTERACTIONS = "InteractionLog"
 TOKEN_CACHE_FILE = "msal_token_cache.bin"
@@ -197,12 +197,7 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
     logging.info(f"    - Company: '{new_opportunity.get('contact_company', 'NA')}'")
     logging.info(f"    - Email: '{new_opportunity.get('contact_email', 'NA')}'")
     
-    logging.info(f"🔍 DEBUG: Matching against {len(existing_opportunities)} existing opportunities:")
-    if existing_opportunities:
-        for i, opp in enumerate(existing_opportunities[-3:]):  # Show last 3
-            logging.info(f"    [{len(existing_opportunities)-3+i}] Title: '{opp['title']}' | Company: '{opp['company']}' | ID: {opp['id'][:8]}...")
-    else:
-        logging.info("    - No existing opportunities to match against")
+    logging.info(f"🔍 DEBUG: Total opportunities available: {len(existing_opportunities)}")
     
     if not existing_opportunities and not historical_emails:
         logging.info("🔍 DEBUG: No existing opportunities or historical emails - returning None")
@@ -213,14 +208,79 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         model = genai.GenerativeModel('gemini-1.5-flash')
         logging.info("🔍 DEBUG: Gemini model configured successfully")
         
+        # 🔧 CRITICAL FIX: Show ALL opportunities, prioritizing recent ones
+        # Instead of only showing last 20, show ALL but organize them better
+        
+        # Step 1: Get keyword-relevant opportunities first
+        new_title = new_opportunity.get('title', '').lower()
+        new_summary = new_opportunity.get('summary', '').lower()
+        new_company = new_opportunity.get('contact_company', '').lower()
+        new_email = new_opportunity.get('contact_email', '').lower()
+        
+        # Extract keywords for better matching
+        keywords = []
+        for text in [new_title, new_summary, new_company]:
+            if text and text != 'na':
+                # Split and get meaningful words (length > 2)
+                words = [word.strip() for word in text.split() if len(word.strip()) > 2]
+                keywords.extend(words)
+        
+        # Remove common words
+        common_words = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'are', 'was', 'will', 'have', 'has', 'can', 'but', 'not', 'you', 'all', 'our', 'your'}
+        keywords = [k for k in keywords if k.lower() not in common_words]
+        
+        logging.info(f"🔍 DEBUG: Extracted keywords: {keywords[:10]}")  # Show first 10
+        
+        # Step 2: Score and sort opportunities by relevance
+        scored_opportunities = []
+        
+        for opp in existing_opportunities:
+            score = 0
+            opp_text = f"{opp.get('title', '')} {opp.get('summary', '')} {opp.get('company', '')}".lower()
+            
+            # Exact company match gets highest score
+            if new_company and new_company != 'na' and new_company in opp_text:
+                score += 100
+            
+            # Email domain match
+            if new_email and '@' in new_email:
+                domain = new_email.split('@')[1]
+                if domain in opp_text:
+                    score += 50
+            
+            # Keyword matches
+            for keyword in keywords:
+                if keyword.lower() in opp_text:
+                    score += 10
+            
+            # Project type matches (special cases)
+            project_terms = ['mobile app', 'website', 'cloud', 'training', 'development', 'redesign', 'upgrade']
+            for term in project_terms:
+                if term in new_title or term in new_summary:
+                    if term in opp_text:
+                        score += 30
+            
+            scored_opportunities.append((score, opp))
+        
+        # Sort by score (highest first), then by recency
+        scored_opportunities.sort(key=lambda x: (-x[0], -existing_opportunities.index(x[1])))
+        
+        # Step 3: Take top 30 most relevant opportunities for AI analysis
+        top_opportunities = [opp for score, opp in scored_opportunities[:30]]
+        
+        # 🔍 DEBUG: Log what opportunities we're showing to AI
+        logging.info(f"🔍 DEBUG: Showing {len(top_opportunities)} most relevant opportunities to AI:")
+        for i, opp in enumerate(top_opportunities[:10]):  # Show first 10 in logs
+            score = scored_opportunities[i][0] if i < len(scored_opportunities) else 0
+            logging.info(f"    [{i+1:2d}] (Score: {score:3d}) '{opp['title']}' | Company: '{opp['company']}' | ID: {opp['id'][:8]}...")
+        
         # Prepare existing opportunities context
         existing_list_str = ""
-        if existing_opportunities:
-            existing_list_str = "EXISTING OPPORTUNITIES:\n" + "\n".join([
-                f"- ID: {opp['id']}, Company: {opp['company']}, Title: {opp['title']}, Summary: {opp['summary'][:200]}"
-                for opp in existing_opportunities[-5:]  # Show last 5 for better context
+        if top_opportunities:
+            existing_list_str = "EXISTING OPPORTUNITIES (Most Relevant 30):\n" + "\n".join([
+                f"- ID: {opp['id']}, Company: {opp['company']}, Title: {opp['title']}, Summary: {opp['summary'][:150]}"
+                for opp in top_opportunities
             ])
-            logging.info(f"🔍 DEBUG: Prepared context with {len(existing_opportunities[-5:])} opportunities")
         
         # Prepare historical emails context (focus on relevant ones)
         historical_context = ""
@@ -229,48 +289,77 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
             # Filter historical emails that might be relevant based on sender or keywords
             sender_company = (new_opportunity.get('contact_company') or '').lower()
             sender_email = new_opportunity.get('contact_email', '').lower()
-            title_keywords = new_opportunity.get('title', '').lower().split()
             
             for email in historical_emails[:50]:  # Limit for performance
                 email_content = f"{email['subject']} {email['body']}".lower()
                 email_sender = email['sender_email'].lower()
                 
-                # Check for relevance
-                if (sender_company and sender_company in email_content) or \
-                   (sender_email and sender_email == email_sender) or \
-                   any(keyword in email_content for keyword in title_keywords if len(keyword) > 3):
-                    relevant_historical.append(email)
+                # Check for relevance using keywords and sender info
+                relevance_score = 0
+                
+                # Sender match
+                if sender_email and sender_email == email_sender:
+                    relevance_score += 50
+                
+                # Company match
+                if sender_company and sender_company != 'na' and sender_company in email_content:
+                    relevance_score += 30
+                
+                # Keyword matches
+                for keyword in keywords:
+                    if keyword.lower() in email_content:
+                        relevance_score += 5
+                
+                if relevance_score >= 10:  # Threshold for relevance
+                    relevant_historical.append((relevance_score, email))
+            
+            # Sort by relevance and take top 10
+            relevant_historical.sort(key=lambda x: -x[0])
+            relevant_historical = [email for score, email in relevant_historical[:10]]
             
             if relevant_historical:
                 historical_context = "\n\nRELEVANT HISTORICAL EMAILS:\n" + "\n".join([
                     f"- Date: {email['received_date'][:10]}, From: {email['sender_name']}, Subject: {email['subject']}, Preview: {email['body'][:200]}..."
-                    for email in relevant_historical[:10]  # Further limit
+                    for email in relevant_historical
                 ])
                 logging.info(f"🔍 DEBUG: Found {len(relevant_historical)} relevant historical emails")
 
-        # 🔧 SIMPLIFIED PROMPT for better matching
+        # 🔧 ENHANCED PROMPT with better matching logic
         prompt = f"""
-You are a CRM assistant analyzing if two business communications are about the same opportunity.
+You are a CRM assistant analyzing if a new email is about the same business opportunity as any existing ones.
 
-NEW EMAIL:
+NEW EMAIL TO ANALYZE:
 Title: "{new_opportunity.get('title', 'NA')}"
-Summary: "{new_opportunity.get('summary', 'NA')[:300]}"
+Summary: "{new_opportunity.get('summary', 'NA')[:400]}"
 Company: "{new_opportunity.get('contact_company', 'NA')}"
 Sender: "{new_opportunity.get('sender_name', 'NA')}"
+Email: "{new_opportunity.get('contact_email', 'NA')}"
 
-EXISTING OPPORTUNITIES TO MATCH AGAINST:
 {existing_list_str}
+{historical_context}
 
-MATCHING RULES:
-1. Same project name or very similar project (e.g., "Leadership Training" matches "Leadership Training Program")
-2. Same company name or clear company connection
-3. Similar service/product request
-4. "Re:" or follow-up indicators in subject
+CRITICAL MATCHING RULES:
+1. **Project Keywords**: Match on specific project terms like "EduTech", "Mobile App", "E-learning", "Cloud Migration", etc.
+2. **Company Names**: Same company or organization name
+3. **Follow-up Language**: "proposal update", "regarding the project", references to previous communications
+4. **Service Type**: Same type of service/product being discussed
+5. **Email Patterns**: Same sender asking about previous projects
 
-IMPORTANT: Be generous with matching - if it's clearly the same type of project/service, it should match!
+IMPORTANT EXAMPLES:
+- "EduTech Mobile App proposal update" should match "Mobile App Development for E-learning Platform" by EduTech Innovations
+- "Update on cloud migration" should match "Cloud Migration for [Company]"
+- "Re: Website project" should match "Website Development" or "Website Redesign"
+- "Proposal update" with "EduTech Mobile app" in content should match EduTech opportunities
+
+BE GENEROUS with matching - if it's clearly about the same project/service type and company, it should match!
+
+Look specifically for:
+- EduTech/Education related projects when "EduTech" or "Mobile app" is mentioned
+- Same sender following up on previous conversations
+- Similar project descriptions even with different wording
 
 Respond ONLY with valid JSON:
-{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Brief explanation"}}
+{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Detailed explanation of matching logic"}}
 """
         
         logging.info("🔍 DEBUG: Sending request to Gemini...")
@@ -291,8 +380,8 @@ Respond ONLY with valid JSON:
         logging.info(f"🔍 DEBUG: Match: {is_match}, Confidence: {confidence:.1%}")
         logging.info(f"🔍 DEBUG: Reason: {reason}")
         
-        # 🔧 LOWERED CONFIDENCE THRESHOLD even more for testing
-        confidence_threshold = 0.5  # Very low threshold for testing
+        # 🔧 LOWER CONFIDENCE THRESHOLD for better matching
+        confidence_threshold = 0.5  # Reduced from 0.6 to 0.5
         
         if is_match and confidence >= confidence_threshold:
             opp_id = result.get("opportunity_id")
@@ -319,6 +408,7 @@ Respond ONLY with valid JSON:
         logging.error(f"❌ AI contextual match failed with error: {e}")
         logging.error(f"❌ Error type: {type(e).__name__}")
         return None, []
+    
     
 def find_earliest_mention(opportunity_data, relevant_historical_emails):
     """Finds the earliest mention of this opportunity in historical emails using AI."""
@@ -414,6 +504,97 @@ def append_rows_to_excel(rows, table_name, sheet_name, file_id, headers):
             logging.error(f"❌ Failed to insert row into {table_name}: {res.text}")
         else:
             logging.info(f"✅ Successfully inserted 1 row into {table_name}.")
+# Add this debug function to your script to investigate
+
+def debug_missing_opportunity():
+    """Debug function to find the missing EduTech opportunity"""
+    try:
+        headers = get_access_token(CLIENT_ID, TENANT_ID)
+        excel_file_id = get_excel_file_id(EXCEL_SHARE_LINK, headers)
+        
+        # Get ALL opportunities from Excel
+        url = f"https://graph.microsoft.com/v1.0/me/drive/items/{excel_file_id}/workbook/worksheets('{SHEET_OPPORTUNITIES}')/usedRange(valuesOnly=true)"
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        values = res.json().get("values", [])
+        
+        print(f"\n🔍 DEBUGGING: Found {len(values)-1} total opportunities in Excel:")
+        print("=" * 80)
+        
+        # Look for EduTech opportunities
+        edutech_opportunities = []
+        
+        for i, row in enumerate(values[1:], 1):  # Skip header
+            if len(row) > 9:
+                opp_id = row[0]
+                contact_name = row[1] if len(row) > 1 else "N/A"
+                company = row[2] if len(row) > 2 else "N/A"
+                contact_email = row[3] if len(row) > 3 else "N/A"
+                title = row[5] if len(row) > 5 else "N/A"
+                status = row[6] if len(row) > 6 else "N/A"
+                date_created = row[7] if len(row) > 7 else "N/A"
+                summary = row[9] if len(row) > 9 else "N/A"
+                
+                # Check if this is EduTech related
+                is_edutech = any(keyword in str(field).lower() for field in [title, company, summary, contact_name] 
+                               for keyword in ['edutech', 'mobile app', 'e-learning', 'education'])
+                
+                if is_edutech:
+                    edutech_opportunities.append({
+                        'row': i,
+                        'id': opp_id,
+                        'title': title,
+                        'company': company,
+                        'contact': contact_name,
+                        'date': date_created,
+                        'summary': summary[:100] + "..." if len(str(summary)) > 100 else summary
+                    })
+                
+                # Show last 10 opportunities for context
+                if i <= 10:
+                    print(f"Row {i:2d}: ID={str(opp_id)[:8]}... | Title='{title}' | Company='{company}' | Date={str(date_created)[:10]}")
+        
+        print("\n🎯 EDUTECH-RELATED OPPORTUNITIES FOUND:")
+        print("=" * 80)
+        
+        if edutech_opportunities:
+            for opp in edutech_opportunities:
+                print(f"✅ Row {opp['row']}")
+                print(f"   ID: {opp['id']}")
+                print(f"   Title: '{opp['title']}'")
+                print(f"   Company: '{opp['company']}'")
+                print(f"   Contact: '{opp['contact']}'")
+                print(f"   Date: {opp['date']}")
+                print(f"   Summary: {opp['summary']}")
+                print()
+        else:
+            print("❌ No EduTech-related opportunities found!")
+            
+        # Also check what get_existing_opportunities_for_ai() returns
+        print("\n🤖 WHAT AI MATCHING FUNCTION SEES:")
+        print("=" * 80)
+        
+        ai_opportunities = get_existing_opportunities_for_ai(headers, excel_file_id)
+        edutech_in_ai = [opp for opp in ai_opportunities 
+                        if any(keyword in str(opp.get('title', '')).lower() + str(opp.get('company', '')).lower() + str(opp.get('summary', '')).lower()
+                              for keyword in ['edutech', 'mobile app', 'e-learning', 'education'])]
+        
+        if edutech_in_ai:
+            print(f"✅ AI function found {len(edutech_in_ai)} EduTech opportunities:")
+            for opp in edutech_in_ai:
+                print(f"   - ID: {opp['id'][:8]}... | Title: '{opp['title']}' | Company: '{opp['company']}'")
+        else:
+            print("❌ AI function found NO EduTech opportunities!")
+            print(f"AI function returned {len(ai_opportunities)} total opportunities:")
+            for opp in ai_opportunities[-5:]:  # Show last 5
+                print(f"   - Title: '{opp['title']}' | Company: '{opp['company']}'")
+                
+    except Exception as e:
+        print(f"❌ Debug failed: {e}")
+
+# Run this debug function
+if __name__ == "__main__":
+    debug_missing_opportunity()
 
 # === MAIN WORKFLOW ===
 def main():
