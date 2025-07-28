@@ -10,8 +10,11 @@ import msal
 import html2text
 import re
 import google.generativeai as genai
+import numpy as np
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # --- Step 0: Load Environment Variables ---
 load_dotenv()
@@ -132,7 +135,7 @@ def parse_email_for_opportunities(subject, body, sender_email):
     if not GEMINI_API_KEY or "YOUR_GEMINI_API_KEY" in GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set in configuration.")
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-2.5-flash')
     prompt = f"""
 You are a CRM assistant. Given the email below, extract all distinct sales opportunities. For each opportunity, return: title, summary, action_item, contact_name, contact_company, and contact_email. If no opportunities are found, return an empty list: []
 
@@ -164,7 +167,7 @@ Body: {body[:2000]}
         logging.error(f"Gemini parsing failed: {e}"); return []
 
 def get_existing_opportunities_for_ai(headers, file_id):
-    """Fetches existing opportunities for the AI contextual match."""
+    """Fetches existing opportunities for the vector matching."""
     url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id}/workbook/worksheets('{SHEET_OPPORTUNITIES}')/usedRange(valuesOnly=true)"
     try:
         res = requests.get(url, headers=headers)
@@ -180,17 +183,33 @@ def get_existing_opportunities_for_ai(headers, file_id):
                     "title": title, 
                     "company": company
                 })
-        logging.info(f"  Found {len(opportunity_list)} existing opportunities for AI matching.")
+        logging.info(f"  Found {len(opportunity_list)} existing opportunities for vector matching.")
         return opportunity_list
     except Exception as e:
         logging.error(f"Error fetching from Excel: {e}"); 
         return []
 
-def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, historical_emails):
-    """Uses AI to determine if a new opportunity is a follow-up to an existing one using comprehensive data."""
+def create_text_vector(text_data):
+    """Creates a text representation for vectorization."""
+    if not text_data:
+        return ""
     
-    # 🔍 ALWAYS log debug info first
-    logging.info(f"      DEBUG: Starting AI match analysis...")
+    # Combine all available text fields
+    combined_text = ""
+    if isinstance(text_data, dict):
+        for key in ['title', 'summary', 'company', 'contact_company']:
+            value = text_data.get(key, '')
+            if value and str(value).lower() != 'na':
+                combined_text += f" {value}"
+    else:
+        combined_text = str(text_data)
+    
+    return combined_text.strip().lower()
+
+def find_related_opportunity_with_vectors(new_opportunity, existing_opportunities, historical_emails):
+    """Uses vector similarity to determine if a new opportunity is related to an existing one."""
+    
+    logging.info(f"      DEBUG: Starting vector match analysis...")
     logging.info(f"      DEBUG: New opportunity details:")
     logging.info(f"    - Title: '{new_opportunity.get('title', 'NA')}'")
     logging.info(f"    - Summary: '{new_opportunity.get('summary', 'NA')[:100]}...'")
@@ -199,11 +218,11 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
     
     logging.info(f"  DEBUG: Total opportunities available: {len(existing_opportunities)}")
     
-    if not existing_opportunities and not historical_emails:
-        logging.info("  DEBUG: No existing opportunities or historical emails - returning None")
-        return None, None
+    if not existing_opportunities:
+        logging.info("  DEBUG: No existing opportunities - returning None")
+        return None, []
     
-    # 🏢 PRIORITY 1: Check for EXACT company name match first
+    # PRIORITY 1: Check for EXACT company name match first
     new_company = (new_opportunity.get('contact_company', '') or '').strip().lower()
     new_email_domain = ''
     if new_opportunity.get('contact_email', '') and '@' in new_opportunity.get('contact_email', ''):
@@ -230,7 +249,7 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
                 logging.info(f"  Returning Opportunity ID: {opp['id']}")
                 return opp['id'], []
     
-    # 📧 PRIORITY 2: Check for same email domain match
+    # PRIORITY 2: Check for same email domain match
     if new_email_domain:
         logging.info(f"  DOMAIN CHECK: Looking for domain match: '{new_email_domain}'")
         
@@ -243,233 +262,106 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
                 return opp['id'], []
     
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        logging.info("  DEBUG: Gemini model configured successfully")
+        logging.info("  DEBUG: Starting vector similarity analysis...")
         
-        # 🔧 CRITICAL FIX: Show ALL opportunities, prioritizing recent ones
-        # Instead of only showing last 20, show ALL but organize them better
-        
-        # Step 1: Get keyword-relevant opportunities first
-        new_title = new_opportunity.get('title', '').lower()
-        new_summary = new_opportunity.get('summary', '').lower()
-        new_email = new_opportunity.get('contact_email', '').lower()
-        
-        # Extract keywords for better matching
-        keywords = []
-        for text in [new_title, new_summary, new_company]:
-            if text and text != 'na':
-                # Split and get meaningful words (length > 2)
-                words = [word.strip() for word in text.split() if len(word.strip()) > 2]
-                keywords.extend(words)
-        
-        # Remove common words
-        common_words = {'the', 'and', 'for', 'with', 'from', 'this', 'that', 'are', 'was', 'will', 'have', 'has', 'can', 'but', 'not', 'you', 'all', 'our', 'your'}
-        keywords = [k for k in keywords if k.lower() not in common_words]
-        
-        logging.info(f"  DEBUG: Extracted keywords: {keywords[:10]}")  # Show first 10
-        
-        # Step 2: Score and sort opportunities by relevance
-        scored_opportunities = []
+        # Create text representations for vectorization
+        new_opp_text = create_text_vector(new_opportunity)
+        existing_texts = []
         
         for opp in existing_opportunities:
-            score = 0
-            opp_text = f"{opp.get('title', '')} {opp.get('summary', '')} {opp.get('company', '')}".lower()
-            opp_company = (opp.get('company', '') or '').strip().lower()
-            
-            # 🏢 HIGHEST PRIORITY: Exact company match gets maximum score
-            if new_company and new_company != 'na' and opp_company == new_company:
-                score += 1000  # Massively higher score for exact company match
-                logging.info(f"  EXACT COMPANY MATCH: {opp_company} == {new_company} (+1000 points)")
-            
-            # Partial company match gets very high score
-            elif new_company and new_company != 'na' and len(new_company) > 3:
-                # Check for non-empty opp_company before 'in' comparison
-                if opp_company and (new_company in opp_company or opp_company in new_company):
-                    score += 500  # Very high score for partial company match
-                    logging.info(f"🏢 PARTIAL COMPANY MATCH: {opp_company} ~ {new_company} (+500 points)")
-            
-            # General company mention in text
-            elif new_company and new_company != 'na' and new_company in opp_text:
-                score += 200
-            
-            # Email domain match
-            if new_email_domain and new_email_domain in opp_text:
-                score += 100
-            
-            # Keyword matches
-            for keyword in keywords:
-                if keyword.lower() in opp_text:
-                    score += 10
-            
-            # Project type matches (special cases)
-            project_terms = ['mobile app', 'website', 'cloud', 'training', 'development', 'redesign', 'upgrade']
-            for term in project_terms:
-                if term in new_title or term in new_summary:
-                    if term in opp_text:
-                        score += 30
-            
-            scored_opportunities.append((score, opp))
+            existing_text = create_text_vector(opp)
+            existing_texts.append(existing_text)
         
-        # Sort by score (highest first), then by recency
-        scored_opportunities.sort(key=lambda x: (-x[0], -existing_opportunities.index(x[1])))
+        if not new_opp_text or not any(existing_texts):
+            logging.info("  DEBUG: Insufficient text data for vectorization")
+            return None, []
         
-        # 🏢 If we have a high-scoring company match (500+), return it immediately
-        if scored_opportunities and scored_opportunities[0][0] >= 500:
-            top_match = scored_opportunities[0][1]
-            score = scored_opportunities[0][0]
-            logging.info(f"  HIGH-SCORE COMPANY MATCH FOUND!")
-            logging.info(f"  Score: {score}, Opportunity ID: {top_match['id']}")
-            logging.info(f"  Company: '{top_match.get('company', 'NA')}'")
-            return top_match['id'], []
+        # Create TF-IDF vectors
+        all_texts = [new_opp_text] + existing_texts
         
-        # Step 3: Take top 30 most relevant opportunities for AI analysis
-        top_opportunities = [opp for score, opp in scored_opportunities[:30]]
+        # Use TF-IDF vectorizer with parameters optimized for business text
+        vectorizer = TfidfVectorizer(
+            max_features=1000,
+            stop_words='english',
+            ngram_range=(1, 2),  # Include bigrams for better context
+            min_df=1,
+            max_df=0.95
+        )
         
-        # 🔍 DEBUG: Log what opportunities we're showing to AI
-        logging.info(f"🔍 DEBUG: Showing {len(top_opportunities)} most relevant opportunities to AI:")
-        for i, (score, opp) in enumerate(scored_opportunities[:10]):  # Show first 10 in logs
-            logging.info(f"    [{i+1:2d}] (Score: {score:3d}) '{opp['title']}' | Company: '{opp.get('company', 'NA')}' | ID: {opp['id'][:8]}...")
+        try:
+            tfidf_matrix = vectorizer.fit_transform(all_texts)
+        except ValueError as e:
+            logging.info(f"  DEBUG: Vectorization failed: {e}")
+            return None, []
         
-        # Prepare existing opportunities context
-        existing_list_str = ""
-        if top_opportunities:
-            existing_list_str = "EXISTING OPPORTUNITIES (Most Relevant 30):\n" + "\n".join([
-                f"- ID: {opp['id']}, Company: {opp.get('company', 'NA')}, Title: {opp['title']}, Summary: {opp['summary'][:150]}"
-                for opp in top_opportunities
-            ])
+        # Calculate cosine similarity between new opportunity and all existing ones
+        new_vector = tfidf_matrix[0:1]  # First vector is the new opportunity
+        existing_vectors = tfidf_matrix[1:]  # Rest are existing opportunities
         
-        # Prepare historical emails context (focus on relevant ones)
-        historical_context = ""
-        relevant_historical = []
-        if historical_emails:
-            # Filter historical emails that might be relevant based on sender or keywords
-            sender_company = new_company
-            sender_email = new_opportunity.get('contact_email', '').lower()
+        similarities = cosine_similarity(new_vector, existing_vectors)[0]
+        
+        # Find the best match
+        max_similarity_idx = np.argmax(similarities)
+        max_similarity = similarities[max_similarity_idx]
+        
+        logging.info(f"  DEBUG: Vector similarity analysis complete")
+        logging.info(f"  DEBUG: Best match similarity: {max_similarity:.3f}")
+        
+        # Set similarity threshold - companies with exact/partial matches get higher threshold
+        similarity_threshold = 0.1  # Lowered threshold for vector similarity
+        
+        # Apply company boost
+        best_match_opp = existing_opportunities[max_similarity_idx]
+        best_match_company = (best_match_opp.get('company', '') or '').strip().lower()
+        
+        # Boost similarity score for company matches
+        company_boost = 0
+        if new_company and new_company != 'na' and best_match_company:
+            if new_company == best_match_company:
+                company_boost = 0.4  # Significant boost for exact company match
+            elif (len(new_company) > 3 and new_company in best_match_company) or \
+                 (len(best_match_company) > 3 and best_match_company in new_company):
+                company_boost = 0.2  # Moderate boost for partial company match
+        
+        adjusted_similarity = max_similarity + company_boost
+        
+        logging.info(f"  DEBUG: Adjusted similarity (with company boost): {adjusted_similarity:.3f}")
+        logging.info(f"  DEBUG: Company boost applied: {company_boost:.3f}")
+        
+        if adjusted_similarity >= similarity_threshold:
+            matched_opp_id = best_match_opp['id']
+            logging.info(f"VECTOR MATCH FOUND!")
+            logging.info(f"Matched to Opportunity ID: {matched_opp_id}")
+            logging.info(f"Similarity: {adjusted_similarity:.3f} (threshold: {similarity_threshold:.3f})")
+            logging.info(f"Matched opportunity: '{best_match_opp.get('title', 'NA')}' | Company: '{best_match_opp.get('company', 'NA')}'")
             
-            for email in historical_emails[:50]:  # Limit for performance
-                email_content = f"{email['subject']} {email['body']}".lower()
-                email_sender = email['sender_email'].lower()
+            # Find relevant historical emails based on the match
+            relevant_historical = []
+            if historical_emails:
+                # Simple keyword matching for historical emails
+                keywords = new_opp_text.split()[:10]  # Use first 10 words as keywords
                 
-                # Check for relevance using keywords and sender info
-                relevance_score = 0
+                for email in historical_emails[:50]:  # Limit for performance
+                    email_content = f"{email['subject']} {email['body']}".lower()
+                    relevance_score = sum(1 for keyword in keywords if keyword in email_content)
+                    
+                    if relevance_score >= 2:  # At least 2 keyword matches
+                        relevant_historical.append(email)
                 
-                # Sender match
-                if sender_email and sender_email == email_sender:
-                    relevance_score += 50
-                
-                # Company match
-                if sender_company and sender_company != 'na' and sender_company in email_content:
-                    relevance_score += 30
-                
-                # Keyword matches
-                for keyword in keywords:
-                    if keyword.lower() in email_content:
-                        relevance_score += 5
-                
-                if relevance_score >= 10:  # Threshold for relevance
-                    relevant_historical.append((relevance_score, email))
+                relevant_historical = relevant_historical[:10]  # Limit to top 10
             
-            # Sort by relevance and take top 10
-            relevant_historical.sort(key=lambda x: -x[0])
-            relevant_historical = [email for score, email in relevant_historical[:10]]
-            
-            if relevant_historical:
-                historical_context = "\n\nRELEVANT HISTORICAL EMAILS:\n" + "\n".join([
-                    f"- Date: {email['received_date'][:10]}, From: {email['sender_name']}, Subject: {email['subject']}, Preview: {email['body'][:200]}..."
-                    for email in relevant_historical
-                ])
-                logging.info(f" DEBUG: Found {len(relevant_historical)} relevant historical emails")
-
-        # 🔧 ENHANCED PROMPT with STRONG company matching emphasis
-        prompt = f"""
-You are a CRM assistant analyzing if a new email is about the same business opportunity as any existing ones.
-
-CRITICAL RULE: If the company names are the SAME or very similar, they should ALWAYS match, regardless of other factors.
-
-NEW EMAIL TO ANALYZE:
-Title: "{new_opportunity.get('title', 'NA')}"
-Summary: "{new_opportunity.get('summary', 'NA')[:400]}"
-Company: "{new_opportunity.get('contact_company', 'NA')}"
-Sender: "{new_opportunity.get('sender_name', 'NA')}"
-Email: "{new_opportunity.get('contact_email', 'NA')}"
-
-{existing_list_str}
-{historical_context}
-
-MATCHING PRIORITY ORDER (HIGHEST TO LOWEST):
-1.   **COMPANY NAME MATCH** (HIGHEST PRIORITY)
-   - Exact company name match = DEFINITE MATCH
-   - Similar company names = VERY LIKELY MATCH
-   - Same organization/entity = MATCH
-
-2. **Project/Service Similarity**
-   - Same type of project (mobile app, website, etc.)
-   - Similar service requests
-
-3. **Communication Context**
-   - Follow-up language, references to previous discussions
-   - Same email sender
-
-CRITICAL EXAMPLES:
-   "EduTech Innovations" should match "EduTech Innovations" (exact)
-   "EduTech Inc" should match "EduTech Innovations" (similar)
-   "Microsoft Corp" should match "Microsoft Corporation" (same entity)
-   "ABC Company Ltd" should match "ABC Company Limited" (same entity)
-
-   **COMPANY MATCHING IS MANDATORY** - If companies are the same/similar, ALWAYS return match=true with high confidence!
-
-Respond ONLY with valid JSON:
-{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Detailed explanation focusing on company match"}}
-"""
-        
-        logging.info("  DEBUG: Sending request to Gemini...")
-        logging.info(f"  DEBUG: Prompt length: {len(prompt)} characters")
-        
-        response = model.generate_content(prompt)
-        clean_response = response.text.strip().replace("```json", "").replace("```", "")
-        
-        logging.info(f"  DEBUG: Raw AI Response: '{clean_response}'")
-        
-        result = json.loads(clean_response)
-        logging.info(f"  DEBUG: Parsed AI Response: {result}")
-        
-        confidence = result.get("confidence", 0)
-        is_match = result.get("match", False)
-        reason = result.get("reason", "No reason provided")
-        
-        logging.info(f"  DEBUG: Match: {is_match}, Confidence: {confidence:.1%}")
-        logging.info(f"  DEBUG: Reason: {reason}")
-        
-        # 🔧 LOWER CONFIDENCE THRESHOLD for company matches
-        confidence_threshold = 0.4  # Reduced from 0.5 to 0.4 for company matches
-        
-        if is_match and confidence >= confidence_threshold:
-            opp_id = result.get("opportunity_id")
-            logging.info(f"AI MATCH FOUND!")
-            logging.info(f"Matched to Opportunity ID: {opp_id}")
-            logging.info(f"Confidence: {confidence:.1%}")
-            logging.info(f"Reason: {reason}")
-            return opp_id, relevant_historical
-        elif is_match:
-            logging.info(f"LOW CONFIDENCE MATCH REJECTED")
-            logging.info(f"Confidence: {confidence:.1%} (threshold: {confidence_threshold:.1%})")
-            logging.info(f"Reason: {reason}")
+            return matched_opp_id, relevant_historical
         else:
-            logging.info(f"NO MATCH FOUND")
-            logging.info(f"Reason: {reason}")
+            logging.info(f"NO VECTOR MATCH FOUND")
+            logging.info(f"Best similarity: {adjusted_similarity:.3f} (threshold: {similarity_threshold:.3f})")
+            logging.info(f"Best candidate: '{best_match_opp.get('title', 'NA')}' | Company: '{best_match_opp.get('company', 'NA')}'")
         
-        return None, relevant_historical
-        
-    except json.JSONDecodeError as e:
-        logging.error(f"JSON parsing error: {e}")
-        logging.error(f"Raw response was: '{clean_response}'")
         return None, []
+        
     except Exception as e:
-        logging.error(f"AI contextual match failed with error: {e}")
+        logging.error(f"Vector similarity matching failed with error: {e}")
         logging.error(f"Error type: {type(e).__name__}")
         return None, []
-
 
 def simple_company_match(new_opportunity, existing_opportunities):
     """Simple fallback function for exact company matching without AI."""
@@ -498,57 +390,55 @@ def simple_company_match(new_opportunity, existing_opportunities):
     return None
 
 def find_earliest_mention(opportunity_data, relevant_historical_emails):
-    """Finds the earliest mention of this opportunity in historical emails using AI."""
+    """Finds the earliest mention of this opportunity in historical emails using vector similarity."""
     if not relevant_historical_emails:
         return None
     
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-    
-    # Sort historical emails by date (oldest first)
-    sorted_emails = sorted(relevant_historical_emails, key=lambda x: x['received_date'])
-    
-    # Prepare email context for AI analysis
-    emails_context = "\n".join([
-        f"Email {i+1}: Date: {email['received_date']}, Subject: {email['subject']}, From: {email['sender_name']}, Content: {email['body'][:300]}..."
-        for i, email in enumerate(sorted_emails[:15])  # Limit to prevent token overflow
-    ])
-    
-    prompt = f"""
-You are analyzing historical emails to find the FIRST mention of a specific business opportunity.
-
-CURRENT OPPORTUNITY:
-- Company: {opportunity_data.get('contact_company', 'NA')}
-- Title: {opportunity_data.get('title', 'NA')}
-- Summary: {opportunity_data.get('summary', 'NA')}
-
-HISTORICAL EMAILS (sorted by date, oldest first):
-{emails_context}
-
-Your task: Identify which email (if any) represents the FIRST mention of this specific opportunity/project.
-
-Rules:
-1. Look for the same project/product/service discussion
-2. Same company context
-3. Must be about the SAME business opportunity, not just general communication
-4. Return the email number (1-based) of the FIRST relevant mention
-5. If no clear first mention found, return null
-
-Respond ONLY with valid JSON: {{"first_mention_email_number": number_or_null, "confidence": 0.0-1.0, "reason": "Brief explanation"}}
-"""
-    
     try:
-        logging.info("  Analyzing historical emails to find earliest mention...")
-        response = model.generate_content(prompt)
-        clean_response = response.text.strip().replace("```json", "").replace("```", "")
-        result = json.loads(clean_response)
+        # Sort historical emails by date (oldest first)
+        sorted_emails = sorted(relevant_historical_emails, key=lambda x: x['received_date'])
         
-        email_number = result.get("first_mention_email_number")
-        confidence = result.get("confidence", 0)
+        # Create text representation of the opportunity for comparison
+        opp_text = create_text_vector(opportunity_data)
         
-        if email_number and confidence >= 0.7 and email_number <= len(sorted_emails):
-            earliest_email = sorted_emails[email_number - 1]  # Convert to 0-based index
-            logging.info(f"  Found earliest mention on {earliest_email['received_date'][:10]} with {confidence:.1%} confidence")
+        if not opp_text:
+            return None
+        
+        # Create email texts for comparison
+        email_texts = []
+        for email in sorted_emails:
+            email_text = f"{email['subject']} {email['body'][:500]}".lower().strip()
+            email_texts.append(email_text)
+        
+        if not email_texts:
+            return None
+        
+        # Use vector similarity to find the most relevant historical email
+        all_texts = [opp_text] + email_texts
+        
+        vectorizer = TfidfVectorizer(
+            max_features=500,
+            stop_words='english',
+            ngram_range=(1, 2),
+            min_df=1,
+            max_df=0.95
+        )
+        
+        tfidf_matrix = vectorizer.fit_transform(all_texts)
+        
+        # Calculate similarity between opportunity and each historical email
+        opp_vector = tfidf_matrix[0:1]
+        email_vectors = tfidf_matrix[1:]
+        
+        similarities = cosine_similarity(opp_vector, email_vectors)[0]
+        
+        # Find the most similar email with minimum threshold
+        max_similarity_idx = np.argmax(similarities)
+        max_similarity = similarities[max_similarity_idx]
+        
+        if max_similarity >= 0.2:  # Minimum similarity threshold
+            earliest_email = sorted_emails[max_similarity_idx]
+            logging.info(f"  Found earliest mention on {earliest_email['received_date'][:10]} with {max_similarity:.2f} similarity")
             return earliest_email['received_date']
         else:
             logging.info("  No clear earliest mention found in historical emails")
@@ -591,8 +481,8 @@ def append_rows_to_excel(rows, table_name, sheet_name, file_id, headers):
             logging.error(f"Failed to insert row into {table_name}: {res.text}")
         else:
             logging.info(f"Successfully inserted 1 row into {table_name}.")
-# Add this debug function to your script to investigate
 
+# Add this debug function to your script to investigate
 def debug_missing_opportunity():
     """Debug function to find the missing EduTech opportunity"""
     try:
@@ -658,7 +548,7 @@ def debug_missing_opportunity():
             print("No EduTech-related opportunities found!")
             
         # Also check what get_existing_opportunities_for_ai() returns
-        print("\n WHAT AI MATCHING FUNCTION SEES:")
+        print("\n WHAT VECTOR MATCHING FUNCTION SEES:")
         print("=" * 80)
         
         ai_opportunities = get_existing_opportunities_for_ai(headers, excel_file_id)
@@ -667,12 +557,12 @@ def debug_missing_opportunity():
                               for keyword in ['edutech', 'mobile app', 'e-learning', 'education'])]
         
         if edutech_in_ai:
-            print(f"AI function found {len(edutech_in_ai)} EduTech opportunities:")
+            print(f"Vector function found {len(edutech_in_ai)} EduTech opportunities:")
             for opp in edutech_in_ai:
                 print(f"   - ID: {opp['id'][:8]}... | Title: '{opp['title']}' | Company: '{opp['company']}'")
         else:
-            print("AI function found NO EduTech opportunities!")
-            print(f"AI function returned {len(ai_opportunities)} total opportunities:")
+            print("Vector function found NO EduTech opportunities!")
+            print(f"Vector function returned {len(ai_opportunities)} total opportunities:")
             for opp in ai_opportunities[-5:]:  # Show last 5
                 print(f"   - Title: '{opp['title']}' | Company: '{opp['company']}'")
                 
@@ -779,17 +669,17 @@ def main():
                             opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
                         ])
                     else:
-                        #  STEP 2: Use AI matching as fallback
+                        #  STEP 2: Use vector matching as fallback
                         logging.info(f"DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
                         
-                        opp_id, relevant_emails = find_related_opportunity_with_ai(
+                        opp_id, relevant_emails = find_related_opportunity_with_vectors(
                             enhanced_opp, 
                             existing_opportunities_list,
                             historical_emails
                         )
                         
                         if opp_id:
-                            logging.info(f"AI MATCH: Assigned to existing Opportunity ID '{opp_id}'")
+                            logging.info(f"VECTOR MATCH: Assigned to existing Opportunity ID '{opp_id}'")
                             interaction_rows.append([
                                 opp_id, received_dt, "Follow-up", "Email", sender_name, 
                                 opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
@@ -847,17 +737,17 @@ def main():
                         body_text[:500], "Review", ""
                     ])
                 else:
-                    # 🤖 STEP 2: Use AI matching as fallback
+                    # 🔍 STEP 2: Use vector matching as fallback
                     logging.info(f"DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
                     
-                    opp_id, relevant_emails = find_related_opportunity_with_ai(
+                    opp_id, relevant_emails = find_related_opportunity_with_vectors(
                         temp_opp, 
                         existing_opportunities_list,
                         historical_emails
                     )
                     
                     if opp_id:
-                        logging.info(f"AI MATCH: General email assigned to Opportunity ID '{opp_id}'")
+                        logging.info(f"VECTOR MATCH: General email assigned to Opportunity ID '{opp_id}'")
                         interaction_rows.append([
                             opp_id, received_dt, "General Communication", "Email", sender_name, 
                             body_text[:500], "Review", ""
