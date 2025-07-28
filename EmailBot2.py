@@ -203,6 +203,45 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         logging.info("🔍 DEBUG: No existing opportunities or historical emails - returning None")
         return None, None
     
+    # 🏢 PRIORITY 1: Check for EXACT company name match first
+    new_company = (new_opportunity.get('contact_company', '') or '').strip().lower()
+    new_email_domain = ''
+    if new_opportunity.get('contact_email', '') and '@' in new_opportunity.get('contact_email', ''):
+        new_email_domain = new_opportunity.get('contact_email', '').split('@')[1].lower()
+    
+    if new_company and new_company != 'na' and new_company != '':
+        logging.info(f"🏢 PRIORITY CHECK: Looking for exact company match: '{new_company}'")
+        
+        for opp in existing_opportunities:
+            existing_company = (opp.get('company', '') or '').strip().lower()
+            
+            # Exact company name match
+            if existing_company == new_company:
+                logging.info(f"🎯 EXACT COMPANY MATCH FOUND!")
+                logging.info(f"🎯 Matched Company: '{existing_company}' == '{new_company}'")
+                logging.info(f"🎯 Returning Opportunity ID: {opp['id']}")
+                return opp['id'], []
+            
+            # Partial company name match (one contains the other)
+            if (len(new_company) > 3 and new_company in existing_company) or \
+               (len(existing_company) > 3 and existing_company in new_company):
+                logging.info(f"🎯 PARTIAL COMPANY MATCH FOUND!")
+                logging.info(f"🎯 Companies: '{existing_company}' ~ '{new_company}'")
+                logging.info(f"🎯 Returning Opportunity ID: {opp['id']}")
+                return opp['id'], []
+    
+    # 📧 PRIORITY 2: Check for same email domain match
+    if new_email_domain:
+        logging.info(f"📧 DOMAIN CHECK: Looking for domain match: '{new_email_domain}'")
+        
+        for opp in existing_opportunities:
+            # Check if opportunity has email information in summary or title
+            opp_text = f"{opp.get('title', '')} {opp.get('summary', '')}".lower()
+            if new_email_domain in opp_text:
+                logging.info(f"🎯 EMAIL DOMAIN MATCH FOUND!")
+                logging.info(f"🎯 Domain '{new_email_domain}' found in opportunity: {opp['id']}")
+                return opp['id'], []
+    
     try:
         genai.configure(api_key=GEMINI_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -214,7 +253,6 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         # Step 1: Get keyword-relevant opportunities first
         new_title = new_opportunity.get('title', '').lower()
         new_summary = new_opportunity.get('summary', '').lower()
-        new_company = new_opportunity.get('contact_company', '').lower()
         new_email = new_opportunity.get('contact_email', '').lower()
         
         # Extract keywords for better matching
@@ -237,16 +275,26 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         for opp in existing_opportunities:
             score = 0
             opp_text = f"{opp.get('title', '')} {opp.get('summary', '')} {opp.get('company', '')}".lower()
+            opp_company = (opp.get('company', '') or '').strip().lower()
             
-            # Exact company match gets highest score
-            if new_company and new_company != 'na' and new_company in opp_text:
-                score += 100
+            # 🏢 HIGHEST PRIORITY: Exact company match gets maximum score
+            if new_company and new_company != 'na' and opp_company == new_company:
+                score += 1000  # Massively higher score for exact company match
+                logging.info(f"🏢 EXACT COMPANY MATCH: {opp_company} == {new_company} (+1000 points)")
+            
+            # Partial company match gets very high score
+            elif new_company and new_company != 'na' and len(new_company) > 3:
+                if new_company in opp_company or opp_company in new_company:
+                    score += 500  # Very high score for partial company match
+                    logging.info(f"🏢 PARTIAL COMPANY MATCH: {opp_company} ~ {new_company} (+500 points)")
+            
+            # General company mention in text
+            elif new_company and new_company != 'na' and new_company in opp_text:
+                score += 200
             
             # Email domain match
-            if new_email and '@' in new_email:
-                domain = new_email.split('@')[1]
-                if domain in opp_text:
-                    score += 50
+            if new_email_domain and new_email_domain in opp_text:
+                score += 100
             
             # Keyword matches
             for keyword in keywords:
@@ -265,20 +313,28 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         # Sort by score (highest first), then by recency
         scored_opportunities.sort(key=lambda x: (-x[0], -existing_opportunities.index(x[1])))
         
+        # 🏢 If we have a high-scoring company match (500+), return it immediately
+        if scored_opportunities and scored_opportunities[0][0] >= 500:
+            top_match = scored_opportunities[0][1]
+            score = scored_opportunities[0][0]
+            logging.info(f"🎯 HIGH-SCORE COMPANY MATCH FOUND!")
+            logging.info(f"🎯 Score: {score}, Opportunity ID: {top_match['id']}")
+            logging.info(f"🎯 Company: '{top_match.get('company', 'NA')}'")
+            return top_match['id'], []
+        
         # Step 3: Take top 30 most relevant opportunities for AI analysis
         top_opportunities = [opp for score, opp in scored_opportunities[:30]]
         
         # 🔍 DEBUG: Log what opportunities we're showing to AI
         logging.info(f"🔍 DEBUG: Showing {len(top_opportunities)} most relevant opportunities to AI:")
-        for i, opp in enumerate(top_opportunities[:10]):  # Show first 10 in logs
-            score = scored_opportunities[i][0] if i < len(scored_opportunities) else 0
-            logging.info(f"    [{i+1:2d}] (Score: {score:3d}) '{opp['title']}' | Company: '{opp['company']}' | ID: {opp['id'][:8]}...")
+        for i, (score, opp) in enumerate(scored_opportunities[:10]):  # Show first 10 in logs
+            logging.info(f"    [{i+1:2d}] (Score: {score:3d}) '{opp['title']}' | Company: '{opp.get('company', 'NA')}' | ID: {opp['id'][:8]}...")
         
         # Prepare existing opportunities context
         existing_list_str = ""
         if top_opportunities:
             existing_list_str = "EXISTING OPPORTUNITIES (Most Relevant 30):\n" + "\n".join([
-                f"- ID: {opp['id']}, Company: {opp['company']}, Title: {opp['title']}, Summary: {opp['summary'][:150]}"
+                f"- ID: {opp['id']}, Company: {opp.get('company', 'NA')}, Title: {opp['title']}, Summary: {opp['summary'][:150]}"
                 for opp in top_opportunities
             ])
         
@@ -287,7 +343,7 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
         relevant_historical = []
         if historical_emails:
             # Filter historical emails that might be relevant based on sender or keywords
-            sender_company = (new_opportunity.get('contact_company') or '').lower()
+            sender_company = new_company
             sender_email = new_opportunity.get('contact_email', '').lower()
             
             for email in historical_emails[:50]:  # Limit for performance
@@ -324,9 +380,11 @@ def find_related_opportunity_with_ai(new_opportunity, existing_opportunities, hi
                 ])
                 logging.info(f"🔍 DEBUG: Found {len(relevant_historical)} relevant historical emails")
 
-        # 🔧 ENHANCED PROMPT with better matching logic
+        # 🔧 ENHANCED PROMPT with STRONG company matching emphasis
         prompt = f"""
 You are a CRM assistant analyzing if a new email is about the same business opportunity as any existing ones.
+
+🏢 CRITICAL RULE: If the company names are the SAME or very similar, they should ALWAYS match, regardless of other factors.
 
 NEW EMAIL TO ANALYZE:
 Title: "{new_opportunity.get('title', 'NA')}"
@@ -338,28 +396,30 @@ Email: "{new_opportunity.get('contact_email', 'NA')}"
 {existing_list_str}
 {historical_context}
 
-CRITICAL MATCHING RULES:
-1. **Project Keywords**: Match on specific project terms like "EduTech", "Mobile App", "E-learning", "Cloud Migration", etc.
-2. **Company Names**: Same company or organization name
-3. **Follow-up Language**: "proposal update", "regarding the project", references to previous communications
-4. **Service Type**: Same type of service/product being discussed
-5. **Email Patterns**: Same sender asking about previous projects
+MATCHING PRIORITY ORDER (HIGHEST TO LOWEST):
+1. 🏢 **COMPANY NAME MATCH** (HIGHEST PRIORITY)
+   - Exact company name match = DEFINITE MATCH
+   - Similar company names = VERY LIKELY MATCH
+   - Same organization/entity = MATCH
 
-IMPORTANT EXAMPLES:
-- "EduTech Mobile App proposal update" should match "Mobile App Development for E-learning Platform" by EduTech Innovations
-- "Update on cloud migration" should match "Cloud Migration for [Company]"
-- "Re: Website project" should match "Website Development" or "Website Redesign"
-- "Proposal update" with "EduTech Mobile app" in content should match EduTech opportunities
+2. **Project/Service Similarity**
+   - Same type of project (mobile app, website, etc.)
+   - Similar service requests
 
-BE GENEROUS with matching - if it's clearly about the same project/service type and company, it should match!
+3. **Communication Context**
+   - Follow-up language, references to previous discussions
+   - Same email sender
 
-Look specifically for:
-- EduTech/Education related projects when "EduTech" or "Mobile app" is mentioned
-- Same sender following up on previous conversations
-- Similar project descriptions even with different wording
+CRITICAL EXAMPLES:
+✅ "EduTech Innovations" should match "EduTech Innovations" (exact)
+✅ "EduTech Inc" should match "EduTech Innovations" (similar)
+✅ "Microsoft Corp" should match "Microsoft Corporation" (same entity)
+✅ "ABC Company Ltd" should match "ABC Company Limited" (same entity)
+
+🏢 **COMPANY MATCHING IS MANDATORY** - If companies are the same/similar, ALWAYS return match=true with high confidence!
 
 Respond ONLY with valid JSON:
-{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Detailed explanation of matching logic"}}
+{{"match": true/false, "opportunity_id": "ID if match found or null", "confidence": 0.0-1.0, "reason": "Detailed explanation focusing on company match"}}
 """
         
         logging.info("🔍 DEBUG: Sending request to Gemini...")
@@ -380,12 +440,12 @@ Respond ONLY with valid JSON:
         logging.info(f"🔍 DEBUG: Match: {is_match}, Confidence: {confidence:.1%}")
         logging.info(f"🔍 DEBUG: Reason: {reason}")
         
-        # 🔧 LOWER CONFIDENCE THRESHOLD for better matching
-        confidence_threshold = 0.5  # Reduced from 0.6 to 0.5
+        # 🔧 LOWER CONFIDENCE THRESHOLD for company matches
+        confidence_threshold = 0.4  # Reduced from 0.5 to 0.4 for company matches
         
         if is_match and confidence >= confidence_threshold:
             opp_id = result.get("opportunity_id")
-            logging.info(f"✅ HIGH CONFIDENCE MATCH FOUND!")
+            logging.info(f"✅ AI MATCH FOUND!")
             logging.info(f"🎯 Matched to Opportunity ID: {opp_id}")
             logging.info(f"🎯 Confidence: {confidence:.1%}")
             logging.info(f"🎯 Reason: {reason}")
@@ -408,8 +468,34 @@ Respond ONLY with valid JSON:
         logging.error(f"❌ AI contextual match failed with error: {e}")
         logging.error(f"❌ Error type: {type(e).__name__}")
         return None, []
+
+
+def simple_company_match(new_opportunity, existing_opportunities):
+    """Simple fallback function for exact company matching without AI."""
+    new_company = (new_opportunity.get('contact_company', '') or '').strip().lower()
     
+    if not new_company or new_company == 'na' or new_company == '':
+        return None
     
+    logging.info(f"🏢 SIMPLE MATCH: Looking for company '{new_company}'")
+    
+    for opp in existing_opportunities:
+        existing_company = (opp.get('company', '') or '').strip().lower()
+        
+        # Exact match
+        if existing_company == new_company:
+            logging.info(f"🎯 SIMPLE EXACT MATCH: '{existing_company}' == '{new_company}'")
+            return opp['id']
+        
+        # Partial match (one contains the other, minimum 4 characters)
+        if len(new_company) >= 4 and len(existing_company) >= 4:
+            if new_company in existing_company or existing_company in new_company:
+                logging.info(f"🎯 SIMPLE PARTIAL MATCH: '{existing_company}' ~ '{new_company}'")
+                return opp['id']
+    
+    logging.info(f"🏢 SIMPLE MATCH: No company match found for '{new_company}'")
+    return None
+
 def find_earliest_mention(opportunity_data, relevant_historical_emails):
     """Finds the earliest mention of this opportunity in historical emails using AI."""
     if not relevant_historical_emails:
@@ -641,10 +727,6 @@ def main():
             if msg_id in processed_emails:
                 continue  # Skip already processed
                 
-            #if "@eucloid.com" in sender_email or "noreply" in sender_email:
-             #   processed_emails.add(msg_id)  # Mark as processed but skip
-              #  continue
-                
             new_messages.append(msg)
 
         logging.info(f"📨 {len(new_messages)} new emails to process after filtering.")
@@ -657,12 +739,6 @@ def main():
 
         new_opportunity_rows = []
         interaction_rows = []
-
-        # Replace your main email processing loop with this improved version
-
-        # Replace your main email processing loop with this corrected version
-
-        # Enhanced email processing loop with debug logging
 
         for msg in new_messages:
             msg_id = msg.get('id')
@@ -692,53 +768,63 @@ def main():
                         'email_subject': subject
                     }
                     
-                    # 🔍 DEBUG: Show current matching list size
-                    logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
+                    # 🏢 STEP 1: Try simple company match first (fastest)
+                    company_match_id = simple_company_match(enhanced_opp, existing_opportunities_list)
                     
-                    # Use the current state of existing_opportunities_list (includes same-session opportunities)
-                    opp_id, relevant_emails = find_related_opportunity_with_ai(
-                        enhanced_opp, 
-                        existing_opportunities_list,  # This is updated in real-time
-                        historical_emails
-                    )
-                    
-                    if opp_id:
-                        logging.info(f"🤖 Matched to existing Opportunity ID '{opp_id}' via comprehensive AI analysis.")
+                    if company_match_id:
+                        logging.info(f"🏢 COMPANY MATCH: Assigned to existing Opportunity ID '{company_match_id}'")
                         interaction_rows.append([
-                            opp_id, received_dt, "Follow-up", "Email", sender_name, 
+                            company_match_id, received_dt, "Follow-up", "Email", sender_name, 
                             opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
                         ])
                     else:
-                        opp_id = str(uuid.uuid4())
-                        logging.info(f"✅ Creating new Opportunity ID '{opp_id}'.")
+                        # 🤖 STEP 2: Use AI matching as fallback
+                        logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
                         
-                        # Find the earliest mention of this opportunity
-                        earliest_mention_date = find_earliest_mention(enhanced_opp, relevant_emails)
-                        first_mention_date = earliest_mention_date if earliest_mention_date else received_dt
+                        opp_id, relevant_emails = find_related_opportunity_with_ai(
+                            enhanced_opp, 
+                            existing_opportunities_list,
+                            historical_emails
+                        )
                         
-                        logging.info(f"📅 First mention date for opportunity: {first_mention_date[:10]}")
-                        
-                        contact_email = enhanced_opp.get("contact_email", "").strip()
-                        new_opportunity_rows.append([
-                            opp_id, opp.get("contact_name", sender_name), 
-                            opp.get("contact_company", "NA"), contact_email,
-                            "", opp.get("title", subject), "New Lead", first_mention_date, conv_id, 
-                            opp.get("summary", "N/A")
-                        ])
-                        interaction_rows.append([
-                            opp_id, received_dt, "New Lead", "Email", sender_name, 
-                            opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
-                        ])
-                        
-                        # ✅ Add to existing opportunities list IMMEDIATELY
-                        new_opp_for_matching = {
-                            "id": opp_id, 
-                            "summary": opp.get("summary", "N/A"), 
-                            "title": opp.get("title", subject), 
-                            "company": opp.get("contact_company", "NA")
-                        }
-                        existing_opportunities_list.append(new_opp_for_matching)
-                        logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
+                        if opp_id:
+                            logging.info(f"🤖 AI MATCH: Assigned to existing Opportunity ID '{opp_id}'")
+                            interaction_rows.append([
+                                opp_id, received_dt, "Follow-up", "Email", sender_name, 
+                                opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
+                            ])
+                        else:
+                            # 🆕 STEP 3: Create new opportunity
+                            opp_id = str(uuid.uuid4())
+                            logging.info(f"✅ NEW OPPORTUNITY: Creating Opportunity ID '{opp_id}'.")
+                            
+                            # Find the earliest mention of this opportunity
+                            earliest_mention_date = find_earliest_mention(enhanced_opp, relevant_emails)
+                            first_mention_date = earliest_mention_date if earliest_mention_date else received_dt
+                            
+                            logging.info(f"📅 First mention date for opportunity: {first_mention_date[:10]}")
+                            
+                            contact_email = enhanced_opp.get("contact_email", "").strip()
+                            new_opportunity_rows.append([
+                                opp_id, opp.get("contact_name", sender_name), 
+                                opp.get("contact_company", "NA"), contact_email,
+                                "", opp.get("title", subject), "New Lead", first_mention_date, conv_id, 
+                                opp.get("summary", "N/A")
+                            ])
+                            interaction_rows.append([
+                                opp_id, received_dt, "New Lead", "Email", sender_name, 
+                                opp.get("summary", "N/A")[:500], opp.get("action_item", "N/A"), ""
+                            ])
+                            
+                            # ✅ Add to existing opportunities list IMMEDIATELY
+                            new_opp_for_matching = {
+                                "id": opp_id, 
+                                "summary": opp.get("summary", "N/A"), 
+                                "title": opp.get("title", subject), 
+                                "company": opp.get("contact_company", "NA")
+                            }
+                            existing_opportunities_list.append(new_opp_for_matching)
+                            logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
             else:
                 # Check if it's a follow-up to existing opportunity
                 logging.info("ℹ️ No new opportunities found. Checking for follow-ups...")
@@ -750,57 +836,65 @@ def main():
                     "sender_name": sender_name
                 }
                 
-                # 🔍 DEBUG: Show current matching list size
-                logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
+                # 🏢 STEP 1: Try simple company match first
+                company_match_id = simple_company_match(temp_opp, existing_opportunities_list)
                 
-                # Use the current state of existing_opportunities_list (includes same-session opportunities)
-                opp_id, relevant_emails = find_related_opportunity_with_ai(
-                    temp_opp, 
-                    existing_opportunities_list,  # This is updated in real-time
-                    historical_emails
-                )
-                
-                if opp_id:
-                    logging.info(f"🤖 Linked general email to Opportunity ID '{opp_id}'.")
+                if company_match_id:
+                    logging.info(f"🏢 COMPANY MATCH: General email assigned to Opportunity ID '{company_match_id}'")
                     interaction_rows.append([
-                        opp_id, received_dt, "General Communication", "Email", sender_name, 
+                        company_match_id, received_dt, "General Communication", "Email", sender_name, 
                         body_text[:500], "Review", ""
                     ])
                 else:
-                    # CREATE NEW OPPORTUNITY FOR GENERAL EMAIL
-                    opp_id = str(uuid.uuid4())
-                    logging.info(f"✅ Creating new Opportunity ID '{opp_id}' for general email.")
+                    # 🤖 STEP 2: Use AI matching as fallback
+                    logging.info(f"🔍 DEBUG: Current matching list has {len(existing_opportunities_list)} opportunities")
                     
-                    # Find the earliest mention of this general communication
-                    earliest_mention_date = find_earliest_mention(temp_opp, relevant_emails)
-                    first_mention_date = earliest_mention_date if earliest_mention_date else received_dt
+                    opp_id, relevant_emails = find_related_opportunity_with_ai(
+                        temp_opp, 
+                        existing_opportunities_list,
+                        historical_emails
+                    )
                     
-                    logging.info(f"📅 First mention date for general opportunity: {first_mention_date[:10]}")
-                    
-                    # Create new opportunity row for general email
-                    new_opportunity_rows.append([
-                        opp_id, sender_name, "NA", sender_email,
-                        "", subject, "General Communication", first_mention_date, conv_id, 
-                        body_text[:500]
-                    ])
-                    interaction_rows.append([
-                        opp_id, received_dt, "General Communication", "Email", sender_name, 
-                        body_text[:500], "Review", ""
-                    ])
-                    
-                    # ✅ Add to existing opportunities list IMMEDIATELY
-                    new_opp_for_matching = {
-                        "id": opp_id, 
-                        "summary": body_text[:500], 
-                        "title": subject, 
-                        "company": "NA"
-                    }
-                    existing_opportunities_list.append(new_opp_for_matching)
-                    logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
+                    if opp_id:
+                        logging.info(f"🤖 AI MATCH: General email assigned to Opportunity ID '{opp_id}'")
+                        interaction_rows.append([
+                            opp_id, received_dt, "General Communication", "Email", sender_name, 
+                            body_text[:500], "Review", ""
+                        ])
+                    else:
+                        # 🆕 STEP 3: Create new opportunity for general email
+                        opp_id = str(uuid.uuid4())
+                        logging.info(f"✅ NEW OPPORTUNITY: Creating Opportunity ID '{opp_id}' for general email.")
+                        
+                        # Find the earliest mention of this general communication
+                        earliest_mention_date = find_earliest_mention(temp_opp, relevant_emails)
+                        first_mention_date = earliest_mention_date if earliest_mention_date else received_dt
+                        
+                        logging.info(f"📅 First mention date for general opportunity: {first_mention_date[:10]}")
+                        
+                        # Create new opportunity row for general email
+                        new_opportunity_rows.append([
+                            opp_id, sender_name, "NA", sender_email,
+                            "", subject, "General Communication", first_mention_date, conv_id, 
+                            body_text[:500]
+                        ])
+                        interaction_rows.append([
+                            opp_id, received_dt, "General Communication", "Email", sender_name, 
+                            body_text[:500], "Review", ""
+                        ])
+                        
+                        # ✅ Add to existing opportunities list IMMEDIATELY
+                        new_opp_for_matching = {
+                            "id": opp_id, 
+                            "summary": body_text[:500], 
+                            "title": subject, 
+                            "company": "NA"
+                        }
+                        existing_opportunities_list.append(new_opp_for_matching)
+                        logging.info(f"🔄 Added new opportunity to matching list: '{new_opp_for_matching['title']}'")
 
             # Mark email as processed
             processed_emails.add(msg_id)
-            
         # Save to Excel
         if new_opportunity_rows or interaction_rows:
             append_rows_to_excel(new_opportunity_rows, "OpportunitiesTable", SHEET_OPPORTUNITIES, excel_file_id, headers)
