@@ -1,4 +1,4 @@
-AI Email Lead Tracker
+#AI Email Lead Tracker
 This script automatically reads new emails from an Outlook inbox, uses Google's AI to identify and analyze potential sales opportunities, and logs them into a structured Excel file on SharePoint.
 
 Features
